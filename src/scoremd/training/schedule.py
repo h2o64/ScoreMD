@@ -113,15 +113,16 @@ class TrainingSchedule(abc.ABC):
             features: Optional[ArrayLike],
             ts: ArrayLike,
             is_special_epoch: bool,
+            training: bool,
         ) -> Tuple[ArrayLike, ArrayLike]:
             # return loss_fns[0](params, key, batch, ts)
-            sum_loss, sum_aux = 0.0, jnp.array([0.0, 0.0, 0.0])
+            sum_loss, sum_aux = 0.0, jnp.array([0.0, 0.0, 0.0, 0.0, 0.0])
             for (t1, t0), loss_fn in zip(self.training_ranges(), loss_fns):
                 loss_match = jnp.any((ts < t1) & (ts > t0))
                 cur_loss, cur_aux = jax.lax.cond(
                     loss_match,
-                    lambda: loss_fn(params, key, batch, features, ts, is_special_epoch),
-                    lambda: (jnp.sum(jnp.array([0.0])), jnp.array([0.0, 0.0, 0.0])),
+                    lambda: loss_fn(params, key, batch, features, ts, is_special_epoch, training),
+                    lambda: (jnp.sum(jnp.array([0.0])), jnp.array([0.0, 0.0, 0.0, 0.0, 0.0])),
                 )
 
                 sum_loss += loss_match * cur_loss
@@ -390,17 +391,23 @@ class AllAtOnce(TrainingSchedule):
         return loss * weights.reshape(-1, 1) / jnp.sum(weights)
 
     def parse_loss(self, loss: jnp.ndarray, epoch: int, prefix: str = "") -> dict:
+        mean_by_range = jnp.mean(loss, axis=0)
+        agg = jnp.sum(mean_by_range, axis=0)
         info = {
-            f"{prefix}loss": jnp.mean(loss, axis=0).sum(),
-            f"{prefix}diffusion_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[0],
-            f"{prefix}vector_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[1],
-            f"{prefix}scalar_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[2],
+            f"{prefix}loss": mean_by_range.sum(),
+            f"{prefix}diffusion_loss": agg[0],
+            f"{prefix}clf_loss": agg[1],
+            f"{prefix}vector_fp_loss": agg[2],
+            f"{prefix}scalar_fp_loss": agg[3],
+            f"{prefix}rne_loss": agg[4],
         }
 
-        info |= {f"{prefix}loss_{i}": jnp.mean(loss, axis=0)[i].sum() for i in range(loss.shape[1])}
-        info |= {f"{prefix}diffusion_loss_{i}": jnp.mean(loss, axis=0)[i][0] for i in range(loss.shape[1])}
-        info |= {f"{prefix}vector_fp_loss_{i}": jnp.mean(loss, axis=0)[i][1] for i in range(loss.shape[1])}
-        info |= {f"{prefix}scalar_fp_loss_{i}": jnp.mean(loss, axis=0)[i][2] for i in range(loss.shape[1])}
+        info |= {f"{prefix}loss_{i}": mean_by_range[i].sum() for i in range(loss.shape[1])}
+        info |= {f"{prefix}diffusion_loss_{i}": mean_by_range[i][0] for i in range(loss.shape[1])}
+        info |= {f"{prefix}clf_loss_{i}": mean_by_range[i][1] for i in range(loss.shape[1])}
+        info |= {f"{prefix}vector_fp_loss_{i}": mean_by_range[i][2] for i in range(loss.shape[1])}
+        info |= {f"{prefix}scalar_fp_loss_{i}": mean_by_range[i][3] for i in range(loss.shape[1])}
+        info |= {f"{prefix}rne_loss_{i}": mean_by_range[i][4] for i in range(loss.shape[1])}
 
         return info
 
@@ -650,18 +657,24 @@ class OneAfterAnother(TrainingSchedule):
         # find the idx of the current epoch
         idx = next(i for i, v in enumerate(epoch_ranges) if v > epoch)
 
+        mean_by_range = jnp.mean(loss, axis=0)
+        agg = jnp.sum(mean_by_range, axis=0)
         info = {
-            f"{prefix}loss": jnp.mean(loss, axis=0).sum(),
-            f"{prefix}diffusion_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[0],
-            f"{prefix}vector_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[1],
-            f"{prefix}scalar_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[2],
+            f"{prefix}loss": mean_by_range.sum(),
+            f"{prefix}diffusion_loss": agg[0],
+            f"{prefix}clf_loss": agg[1],
+            f"{prefix}vector_fp_loss": agg[2],
+            f"{prefix}scalar_fp_loss": agg[3],
+            f"{prefix}rne_loss": agg[4],
         }
 
         info |= {
-            f"{prefix}loss_{idx}": jnp.mean(loss, axis=0).sum(),
-            f"{prefix}diffusion_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[0],
-            f"{prefix}vector_fp_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[1],
-            f"{prefix}scalar_fp_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[2],
+            f"{prefix}loss_{idx}": mean_by_range.sum(),
+            f"{prefix}diffusion_loss_{idx}": agg[0],
+            f"{prefix}clf_loss_{idx}": agg[1],
+            f"{prefix}vector_fp_loss_{idx}": agg[2],
+            f"{prefix}scalar_fp_loss_{idx}": agg[3],
+            f"{prefix}rne_loss_{idx}": agg[4],
         }
 
         return info

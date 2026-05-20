@@ -12,6 +12,8 @@ from jax.typing import ArrayLike
 from flax.core import FrozenDict
 from scoremd.utils.diffusion import batch_mul, get_score
 import scoremd.diffusion.classic.sde as sdes
+from scoremd.diffusion.diffclf import diffclf_loss_fn
+from scoremd.diffusion.rne import rne_loss_fn
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +79,11 @@ def get_loss(
     alpha=0.0,
     beta=0.0,
     gamma=1.0,
+    diffclf_weight=0.0,
+    rne_weight=0.0,
+    rne_delta_t=1e-4,
     fp_dist="pert",
+    k=2,
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -92,10 +98,14 @@ def get_loss(
       alpha: A float, the weight of the vector field FP loss.
       beta: A float, the weight of the scalar field FP loss.
       gamma: A float, the weight of the diffusion loss.
+      diffclf_weight: Coefficient for the DiffCLF regularizer (0 disables it).
+      rne_weight: Coefficient for RNE regularization on special epochs (0 disables).
+      rne_delta_t: Time gap between paired times (s, t) in RNE.
       fp_dist: A string, the distribution to use for the FP loss. Can be 'pert' for perturbed data or 'x' for original data.
         **kwargs: Additional keyword arguments that are passed to the FP loss.
     Returns:
       A loss function that can be used for score matching training and is an expectation of the regression loss over time.
+      Each step returns ``(gamma * diffusion_loss, clf_loss, vector_fp, scalar_fp, rne_loss)``.
     """
     log.info("Using VP-SDE")
     sde = sdes.VP()
@@ -119,6 +129,10 @@ def get_loss(
 
         score = None
         vector_fp, scalar_fp = 0, 0
+        diffusion_loss = 0.0
+        clf_loss = 0.0
+        rne_loss = 0.0
+        has_diffusion_loss = False
         if is_special_epoch:
             min_alpha_beta = 1e-6
             if alpha > min_alpha_beta or beta > min_alpha_beta:
@@ -211,49 +225,177 @@ def get_loss(
                 if len(log_q_evaluated_models) < len(evaluated_models):
                     score = None
 
-        if score is None or fp_dist != "pert":
-            if score is not None:
-                log.info("Score already computed, but with a different fp_dist. fp_dist pert ist the faster option.")
-            # Save a call to the score function
-            score = score_fn(perturbed_data, features, ts)
-        e = errors(perturbed_noise, score, std, likelihood_weighting)
+            # DiffCLF regularization (coefficient zeta; independent of FP alpha/beta).
+            def dsm_loss_fn(noise, score, std, ts):
+                e = errors(noise, score, std, likelihood_weighting)
+                losses = (jnp.abs(e) + 1e-7) ** 2
+                losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1)
+                if likelihood_weighting:
+                    g2 = sde.sde(jnp.zeros_like(noise), ts)[1] ** 2
+                    losses = losses * g2
 
-        # sliced score matching
-        if sliced:
-            log.info("Using sliced score matching ...")
-            vectors = jax.random.normal(error_rng, (batch.shape[0], batch.shape[1]))
+                losses *= time_weighting(ts)
+                return jnp.mean(losses)
 
-            if sliced_noise == "rademacher":
-                vectors = jnp.sign(vectors)
-            elif sliced_noise == "sphere":
-                vectors = (
-                    vectors
-                    / jnp.linalg.norm(vectors, axis=-1).reshape(vectors.shape[0], 1)
-                    * jnp.sqrt(vectors.shape[-1])
+            if diffclf_weight > min_alpha_beta:
+                rng, clf_rng = jax.random.split(rng)
+                energy_models = model.energy_models()
+                if len(energy_models) == 0:
+                    raise ValueError("No energy models found. DiffCLF loss requires energy-capable models.")
+                log_q_evaluated_models = [m for m in energy_models if m in evaluated_models]
+
+                def call_log_q_and_score(x, features, t):
+                    return model.apply(
+                        params,
+                        x,
+                        features,
+                        t,
+                        training,
+                        log_q_evaluated_models,
+                        rngs={"dropout": dropout_rng},
+                        method=model.__class__.log_q_and_score,
+                    )
+
+                def call_log_q(x, features, t):
+                    return model.apply(
+                        params,
+                        x,
+                        features,
+                        t,
+                        training,
+                        log_q_evaluated_models,
+                        rngs={"dropout": dropout_rng},
+                        method=model.__class__.log_q,
+                    )
+
+                log_q_and_score_fn = (
+                    call_log_q_and_score
+                    if hasattr(model.__class__, "log_q_and_score") and model.__class__.log_q_and_score is not None
+                    else None
                 )
-            elif sliced_noise != "gaussian":
-                # for gaussian we don't need to change anything
-                raise ValueError(f"Unknown sliced noise: {sliced_noise}")
 
-            grad1 = score_fn(perturbed_data, features, ts)
-            # loss1 = jnp.sum(grad1 * vectors, axis=-1) ** 2 * 0.5
-            loss1 = jnp.linalg.norm(grad1, ord=2, axis=-1) ** 2 * 0.5  # results in a lower variance
+                log_q_fn = (
+                    call_log_q if hasattr(model.__class__, "log_q") and model.__class__.log_q is not None else None
+                )
 
-            grad2 = jax.grad(lambda x: jnp.sum(score_fn(x, features, ts) * vectors))(perturbed_data)
-            loss2 = jnp.sum(vectors * grad2, axis=-1)
+                log.info(f"Using DiffCLF loss with weight={diffclf_weight} and energy models {log_q_evaluated_models}")
+                clf_loss, diffusion_loss = diffclf_loss_fn(
+                    clf_rng,
+                    sde,
+                    dsm_loss_fn,
+                    get_score(model, params, training, log_q_evaluated_models, rngs={"dropout": dropout_rng}),
+                    log_q_fn,
+                    log_q_and_score_fn,
+                    batch,  # use original x0; DiffCLF perturbs internally
+                    features,
+                    ts.reshape(-1, 1),
+                    diffclf_weight,
+                    k=k,
+                )
+                has_diffusion_loss = True
 
-            diffusion_loss = jnp.mean(loss1 + loss2)
-        else:
-            losses = (jnp.abs(e) + 1e-7) ** 2
-            losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1)
-            if likelihood_weighting:
-                g2 = sde.sde(jnp.zeros_like(batch), ts)[1] ** 2
-                losses = losses * g2
+            # RNE regularization
+            if rne_weight > min_alpha_beta:
+                rng, rne_rng = jax.random.split(rng)
+                energy_models = model.energy_models()
+                if len(energy_models) == 0:
+                    raise ValueError("No energy models found. RNE loss requires energy-capable models.")
+                log_q_evaluated_models = [m for m in energy_models if m in evaluated_models]
 
-            losses *= time_weighting(ts)
-            diffusion_loss = jnp.mean(losses)
+                def call_log_q_and_score(x, features, t):
+                    return model.apply(
+                        params,
+                        x,
+                        features,
+                        t,
+                        training,
+                        log_q_evaluated_models,
+                        rngs={"dropout": dropout_rng},
+                        method=model.__class__.log_q_and_score,
+                    )
 
-        return gamma * diffusion_loss, vector_fp, scalar_fp
+                def call_log_q(x, features, t):
+                    return model.apply(
+                        params,
+                        x,
+                        features,
+                        t,
+                        training,
+                        log_q_evaluated_models,
+                        rngs={"dropout": dropout_rng},
+                        method=model.__class__.log_q,
+                    )
+
+                log_q_and_score_fn = (
+                    call_log_q_and_score
+                    if hasattr(model.__class__, "log_q_and_score") and model.__class__.log_q_and_score is not None
+                    else None
+                )
+
+                log_q_fn = (
+                    call_log_q if hasattr(model.__class__, "log_q") and model.__class__.log_q is not None else None
+                )
+
+                log.info(f"Using RNE loss with weight={rne_weight} and energy models {log_q_evaluated_models}")
+                rne_loss, diffusion_loss = rne_loss_fn(
+                    rne_rng,
+                    sde,
+                    dsm_loss_fn,
+                    get_score(model, params, training, log_q_evaluated_models, rngs={"dropout": dropout_rng}),
+                    log_q_fn,
+                    log_q_and_score_fn,
+                    batch,  # use original x0; RNE perturbs internally
+                    features,
+                    ts.reshape(-1, 1),
+                    rne_weight,
+                    delta_t=rne_delta_t,
+                )
+                has_diffusion_loss = True
+
+        if not has_diffusion_loss:
+            if score is None or fp_dist != "pert":
+                if score is not None:
+                    log.info("Score already computed, but with a different fp_dist. fp_dist pert ist the faster option.")
+                # Save a call to the score function
+                score = score_fn(perturbed_data, features, ts)
+            e = errors(perturbed_noise, score, std, likelihood_weighting)
+
+            # sliced score matching
+            if sliced:
+                log.info("Using sliced score matching ...")
+                vectors = jax.random.normal(error_rng, (batch.shape[0], batch.shape[1]))
+
+                if sliced_noise == "rademacher":
+                    vectors = jnp.sign(vectors)
+                elif sliced_noise == "sphere":
+                    vectors = (
+                        vectors
+                        / jnp.linalg.norm(vectors, axis=-1).reshape(vectors.shape[0], 1)
+                        * jnp.sqrt(vectors.shape[-1])
+                    )
+                elif sliced_noise != "gaussian":
+                    # for gaussian we don't need to change anything
+                    raise ValueError(f"Unknown sliced noise: {sliced_noise}")
+
+                grad1 = score_fn(perturbed_data, features, ts)
+                # loss1 = jnp.sum(grad1 * vectors, axis=-1) ** 2 * 0.5
+                loss1 = jnp.linalg.norm(grad1, ord=2, axis=-1) ** 2 * 0.5  # results in a lower variance
+
+                grad2 = jax.grad(lambda x: jnp.sum(score_fn(x, features, ts) * vectors))(perturbed_data)
+                loss2 = jnp.sum(vectors * grad2, axis=-1)
+
+                diffusion_loss = jnp.mean(loss1 + loss2)
+            else:
+                losses = (jnp.abs(e) + 1e-7) ** 2
+                losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1)
+                if likelihood_weighting:
+                    g2 = sde.sde(jnp.zeros_like(batch), ts)[1] ** 2
+                    losses = losses * g2
+
+                losses *= time_weighting(ts)
+                diffusion_loss = jnp.mean(losses)
+
+        return gamma * diffusion_loss, clf_loss, vector_fp, scalar_fp, rne_loss
 
     return loss
 

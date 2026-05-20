@@ -32,6 +32,18 @@ from stores import create_dataset_store, create_trainig_schedule_store, create_w
 log = logging.getLogger(__name__)
 
 
+def _partial_keyword(fn, key, default=None):
+    current = fn
+    visited = set()
+    while (current is not None) and (id(current) not in visited):
+        visited.add(id(current))
+        keywords = getattr(current, "keywords", None)
+        if keywords is not None and key in keywords:
+            return keywords[key]
+        current = getattr(current, "func", None)
+    return default
+
+
 def training_routine(
     dataset: Builds[Dataset],
     optimizer: Callable[[int], optax.GradientTransformation],
@@ -265,7 +277,7 @@ if __name__ == "__main__":
         no_evaluation=False,
         evaluation=builds(EvaluationSettings, populate_full_signature=True),
         seed=1,
-        wandb={"enabled": False, "project": "scoremd"},
+        wandb={"enabled": False, "project": "scoremd-diffclf"},
         zen_meta={"model": None},
         populate_full_signature=True,
         hydra_defaults=[

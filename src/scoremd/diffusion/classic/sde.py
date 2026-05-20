@@ -83,7 +83,7 @@ class BetaVE:
         return jnp.sqrt(self.variance(t))
 
     def variance(self, t):
-        return 1.0 - jnp.exp(self.log_mean_coeff(t) * 2)
+        return -jnp.expm1(self.log_mean_coeff(t) * 2)
 
 
 class VP:
@@ -102,13 +102,49 @@ class VP:
         return jnp.sqrt(self.variance(t))
 
     def variance(self, t):
-        return 1.0 - jnp.exp(self.log_mean_coeff(t) * 2)
+        return -jnp.expm1(self.log_mean_coeff(t) * 2)
 
     def marginal_prob(self, x, t):
         return batch_mul(jnp.exp(self.log_mean_coeff(t)), x), self.std(t)
 
     def prior(self, rng, shape):
         return jax.random.normal(rng, shape)
+
+    def forward_transition_params(self, xs, s, delta_t):
+        """
+        Computes the mean and standard deviation of the forward transition p(x_t | x_s).
+        Assumes delta_t > 0, where t = s + delta_t.
+        """
+        t = s + delta_t
+        log_mean_coeff_diff = self.log_mean_coeff(t) - self.log_mean_coeff(s)
+
+        mean = batch_mul(jnp.exp(log_mean_coeff_diff), xs)
+        std = jnp.sqrt(-jnp.expm1(2.0 * log_mean_coeff_diff))
+        return mean, std
+
+    def backward_transition_params(self, xt, t, delta_t, score_xt):
+        """
+        Reverse transition through Exponential Integrator
+        """
+        s = t - delta_t
+
+        log_alpha_ratio = self.log_mean_coeff(s) - self.log_mean_coeff(t)
+        alpha_ratio = jnp.exp(log_alpha_ratio)
+        std_t = self.std(t)
+        std_s = self.std(s)
+
+        # alpha_ratio**2 * std_t**2 - std_s**2 simplifies to alpha_ratio**2 - 1.
+        # prevent 0 variance
+        variance = jnp.maximum(jnp.expm1(2.0 * log_alpha_ratio), 1e-5)
+        denom = alpha_ratio * std_t + std_s
+        denom = jnp.where(denom > 0.0, denom, 1.0)
+        score_coeff = 2.0 * std_t * variance / denom
+
+        mean = batch_mul(alpha_ratio, xt) + batch_mul(score_coeff, score_xt)
+
+        std = jnp.sqrt(variance)
+
+        return mean, std
 
     def reverse(self, score):
         return RVP(score, self.sde, self.beta, self.log_mean_coeff)
