@@ -182,26 +182,12 @@ python train.py dataset=aldp +architecture=transformer/potential \
 If you use any of the additions above, please also cite:
 
 ```
-@inproceedings{anonymous2026a,
-  title = {A Diffusive Classification Loss for Learning Energy-based Generative Models},
-  author = {Anonymous},
-  booktitle = {Forty-third International Conference on Machine Learning},
-  year = {2026},
-  url = {https://openreview.net/forum?id=RVPqygyGRu}
-}
-```
-
-or the arXiv version:
-
-```
-@misc{ouyang2026diffusiveclassificationlosslearning,
-  title = {A Diffusive Classification Loss for Learning Energy-based Generative Models},
-  author = {RuiKang OuYang and Louis Grenioux and Jos{\'e} Miguel Hern{\'a}ndez-Lobato},
-  year = {2026},
-  eprint = {2601.21025},
-  archivePrefix = {arXiv},
-  primaryClass = {stat.ML},
-  url = {https://arxiv.org/abs/2601.21025}
+@inproceedings{ouyang2026diffusiveclassificationlosslearning,
+    title={A Diffusive Classification Loss for Learning Energy-based Generative Models},
+    author={RuiKang OuYang and Louis Grenioux and José Miguel Hernández-Lobato},
+    booktitle={Forty-third International Conference on Machine Learning},
+    year={2026},
+    url={https://arxiv.org/abs/2601.21025},
 }
 ```
 
