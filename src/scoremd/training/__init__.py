@@ -104,9 +104,11 @@ def train(
             if enable_wandb:
                 wandb.log(info)
 
-            pbar_fields = ["loss", "val_loss"]
-            postfix = {i: f"{info[i]:.3f}" for i in pbar_fields if i in info}
-
+            postfix = {}
+            if "train/loss" in info:
+                postfix["loss"] = f"{info['train/loss']:.3f}"
+            if "val/loss" in info:
+                postfix["val_loss"] = f"{info['val/loss']:.3f}"
             pbar.set_postfix(postfix)
 
             if checkpoint_manager is not None and checkpoint_manager.should_save(epoch + 1):
