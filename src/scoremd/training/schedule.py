@@ -61,6 +61,7 @@ class TrainingSchedule(abc.ABC):
         augment: Callable[[ArrayLike, ArrayLike], ArrayLike],
         is_special_epoch: Callable[[int], bool],
         validation_every: int,
+        dsm_warmup_epochs: int = 0,  # 0-based; see subclass docstrings
     ):
         losses = sorted(losses, key=lambda x: x.range[0], reverse=True)
 
@@ -73,6 +74,7 @@ class TrainingSchedule(abc.ABC):
         self.augment = augment
         self.is_special_epoch = is_special_epoch
         self.validation_every = validation_every
+        self.dsm_warmup_epochs = dsm_warmup_epochs
 
     @staticmethod
     def _shuffle(datapoints: Datapoints, BS: int, key: jnp.ndarray) -> jnp.ndarray:
@@ -101,6 +103,7 @@ class TrainingSchedule(abc.ABC):
         features: Optional[ArrayLike],
         ts: ArrayLike,
         is_special_epoch: bool,
+        train_epoch_idx: ArrayLike,
         validation: bool,
         key: ArrayLike,
     ) -> Tuple[EmaTrainState, ArrayLike]:
@@ -130,26 +133,49 @@ class TrainingSchedule(abc.ABC):
             return sum_loss, sum_aux
 
         return TrainingSchedule._train_step_single_loss(
-            merged_loss, state, batch, features, ts, is_special_epoch, validation, key
+            merged_loss,
+            state,
+            batch,
+            features,
+            ts,
+            is_special_epoch,
+            train_epoch_idx,
+            self.dsm_warmup_epochs,
+            validation,
+            key,
         )
 
     @staticmethod
     def _train_step_single_loss(
-        loss_fn: Callable[[FrozenDict[str, Any], ArrayLike, ArrayLike, ArrayLike, bool], Tuple[ArrayLike, ArrayLike]],
+        loss_fn: Callable[..., Tuple[ArrayLike, ArrayLike]],
         state: EmaTrainState,
         batch: ArrayLike,
         features: Optional[ArrayLike],
         ts: ArrayLike,
-        is_special_epoch: bool,
+        base_special: bool,
+        train_epoch_idx: ArrayLike,
+        dsm_warmup_epochs: int,
         validation: bool,
         key: ArrayLike,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         if validation:
-            _, loss = loss_fn(state.params, key, batch, features, ts, is_special_epoch, False)
+            _, loss = loss_fn(state.params, key, batch, features, ts, base_special, False)
             return state, loss
-        (_, loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            state.params, key, batch, features, ts, is_special_epoch, True
-        )
+
+        dsm = jnp.asarray(dsm_warmup_epochs, dtype=jnp.int32)
+        ep = jnp.asarray(train_epoch_idx, dtype=jnp.int32)
+        in_warmup = jnp.logical_and(dsm > 0, ep < dsm)
+        use_special = jnp.logical_and(jnp.asarray(base_special, dtype=jnp.bool_), jnp.logical_not(in_warmup))
+
+        def loss_for_grad(params: FrozenDict[str, Any]) -> Tuple[ArrayLike, ArrayLike]:
+            return jax.lax.cond(
+                use_special,
+                lambda p: loss_fn(p, key, batch, features, ts, True, True),
+                lambda p: loss_fn(p, key, batch, features, ts, False, True),
+                params,
+            )
+
+        (_, loss), grads = jax.value_and_grad(loss_for_grad, has_aux=True)(state.params)
 
         state = state.apply_gradients(grads=grads)
         return state, loss
@@ -163,6 +189,7 @@ class TrainingSchedule(abc.ABC):
         datapoints: Datapoints,
         norm_factor: jnp.ndarray,
         is_special_epoch: bool,
+        train_epoch_idx: ArrayLike,
         validation: bool,
         key: jnp.ndarray,
         data_sharding: Optional[jax.sharding.Sharding],
@@ -205,6 +232,8 @@ class TrainingSchedule(abc.ABC):
                         current_features,
                         ts,
                         is_special_epoch,
+                        train_epoch_idx,
+                        self.dsm_warmup_epochs,
                         validation,
                         step_key,
                     )
@@ -216,6 +245,7 @@ class TrainingSchedule(abc.ABC):
                         current_features,
                         ts,
                         is_special_epoch,
+                        train_epoch_idx,
                         validation,
                         step_key,
                     )
@@ -238,7 +268,7 @@ class TrainingSchedule(abc.ABC):
     def _train_n_epochs(
         self,
         train_single_epoch: Callable[
-            [EmaTrainState, Datapoints, bool, bool, jnp.ndarray], Tuple[EmaTrainState, jnp.ndarray]
+            [EmaTrainState, Datapoints, bool, bool, ArrayLike, jnp.ndarray], Tuple[EmaTrainState, jnp.ndarray]
         ],
         data: Datapoints,
         val_data: Optional[Datapoints],
@@ -282,7 +312,7 @@ class TrainingSchedule(abc.ABC):
                     )
                     special_epoch = False
 
-            new_state, loss = train_single_epoch(state, data, False, special_epoch, iter_key)
+            new_state, loss = train_single_epoch(state, data, False, special_epoch, jnp.int32(epoch), iter_key)
 
             # ensure that we don't get stuck in a nan loop
             if jnp.isnan(loss).any():
@@ -303,7 +333,9 @@ class TrainingSchedule(abc.ABC):
                 state = new_state  # only update the parameters if there was no nan
                 val_loss = None
                 if val_data is not None and epoch % self.validation_every == 0:
-                    _, val_loss = train_single_epoch(state, val_data, True, special_epoch, iter_key)
+                    _, val_loss = train_single_epoch(
+                        state, val_data, True, special_epoch, jnp.int32(epoch - 1), iter_key
+                    )
                 yield state, loss, val_loss
 
     @staticmethod
@@ -365,8 +397,9 @@ class AllAtOnce(TrainingSchedule):
         augment: Callable[[ArrayLike, ArrayLike], ArrayLike] = IDENTITY,
         is_special_epoch: Callable[[int], bool] = always_special,
         validation_every: int = 1,
+        dsm_warmup_epochs: int = 0,  # first N epochs (0-based) use score loss only
     ):
-        super().__init__(losses, BS, BS_factor, augment, is_special_epoch, validation_every)
+        super().__init__(losses, BS, BS_factor, augment, is_special_epoch, validation_every, dsm_warmup_epochs)
         self.epochs = epochs
         self.mixed = mixed
 
@@ -437,7 +470,12 @@ class AllAtOnce(TrainingSchedule):
 
         @partial(jax.jit, static_argnums=(2, 3))
         def step(
-            state: EmaTrainState, data: Datapoints, validation: bool, is_special_epoch: bool, key: jax.random.PRNGKey
+            state: EmaTrainState,
+            data: Datapoints,
+            validation: bool,
+            is_special_epoch: bool,
+            train_epoch_idx: ArrayLike,
+            key: jax.random.PRNGKey,
         ):
             return self._train_epoch(
                 self._sample_ts,
@@ -447,6 +485,7 @@ class AllAtOnce(TrainingSchedule):
                 data,
                 norm_factor,
                 is_special_epoch,
+                train_epoch_idx,
                 validation,
                 key,
                 data_sharding,
@@ -493,8 +532,9 @@ class OneAfterAnother(TrainingSchedule):
         augment: Callable[[ArrayLike, ArrayLike], ArrayLike] = IDENTITY,
         is_special_epoch: Callable[[int], bool] = always_special,
         validation_every: int = 1,
+        dsm_warmup_epochs: int = 0,  # first N epochs per schedule segment (0-based); see AllAtOnce for global epochs
     ):
-        super().__init__(losses, BS, BS_factor, augment, is_special_epoch, validation_every)
+        super().__init__(losses, BS, BS_factor, augment, is_special_epoch, validation_every, dsm_warmup_epochs)
         self.epochs = [epochs] if isinstance(epochs, int) else epochs
         self.order = order
 
@@ -601,6 +641,7 @@ class OneAfterAnother(TrainingSchedule):
                 data: Datapoints,
                 validation: bool,
                 is_special_epoch: bool,
+                train_epoch_idx: ArrayLike,
                 key: jax.random.PRNGKey,
             ):
                 def sample_ts(key):
@@ -617,6 +658,7 @@ class OneAfterAnother(TrainingSchedule):
                     data,
                     norm_factor,
                     is_special_epoch,
+                    train_epoch_idx,
                     validation,
                     key,
                     data_sharding,
