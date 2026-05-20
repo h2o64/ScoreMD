@@ -17,6 +17,7 @@ from scoremd.data.dataset import Dataset
 from scoremd.models import BaseDiffusionModel, EnergyModel, ModelInfo
 from scoremd.models.utils import value_and_grad_sum
 import logging
+from scoremd.models.timenet import TimeNet
 
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class GraphTransformerModelInfo(ModelInfo):
     n_layers: int = 2
     potential: bool = True
     dropout: float = 0.0
+    use_time_net: bool = False
 
     def build(
         self, dataset: Dataset, t0: float, t1: float, rescale_time: bool, clip_time: bool, norm_factor: jnp.ndarray
@@ -52,6 +54,7 @@ class GraphTransformerModelInfo(ModelInfo):
             use_abs_coords=False,
             use_distances=False,
             dropout=self.dropout,
+            use_time_net=self.use_time_net,
         )
 
 
@@ -66,8 +69,19 @@ class GraphTransformer(BaseDiffusionModel, EnergyModel, nn.Module):
     use_abs_coords: bool = False
     use_distances: bool = False
     dropout: float = 0.0
+    use_time_net: bool = False
+
+    def setup(self):
+        self.time_net = None
+        if self.use_time_net:
+            self.time_net = TimeNet(dim_out=1, activation=nn.gelu, num_layers=4, channels=64)
 
     def _forward(self, x, features, t, training):
+        # Init only traces the score path; log_q / log_Z are never run during init, so TimeNet
+        # parameters would be missing unless we touch the submodule here once.
+        if self.use_time_net and self.time_net is not None and self.is_initializing():
+            _ = self.time_net(jnp.zeros((1, 1), dtype=jnp.float32))
+
         if self.potential:
             # we predict an energy for every node, so we need to sum over all nodes
             # we also sum over the batch dimension to get a scalar
@@ -144,6 +158,17 @@ class GraphTransformer(BaseDiffusionModel, EnergyModel, nn.Module):
             bs, n_nodes, _ = x.shape
             return jnp.zeros((bs, n_nodes, n_nodes, 1))
 
+    def log_Z(self, features: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
+        if self.use_time_net:
+            if features is not None:
+                raise NotImplementedError("Log Z is not implemented for models with features")
+            if self.clip_time:
+                t = jnp.clip(t, self.t0, self.t1)
+            log_Z = self.time_net(t)
+        else:
+            log_Z = jnp.zeros((t.shape[0], 1))
+        return log_Z
+
     def log_q(self, x: jnp.ndarray, features: jnp.ndarray, t: jnp.ndarray, training: bool) -> jnp.ndarray:
         if not self.potential:
             log.error(f"Tried to call log_q on a non-potential model with x.shape = {x.shape} and t.shape = {t.shape}")
@@ -153,7 +178,7 @@ class GraphTransformer(BaseDiffusionModel, EnergyModel, nn.Module):
 
         assert x.ndim == t.ndim, f"{x.ndim} != {t.ndim}"
 
-        return -self._differentiable_forward(x, features, t, training).sum(axis=(1, 2))[:, None]
+        return -self._differentiable_forward(x, features, t, training).sum(axis=(1, 2))[:, None] - self.log_Z(features, t)
 
     def log_q_and_score(self, x: jnp.ndarray, features: jnp.ndarray, t: jnp.ndarray, training: bool) -> jnp.ndarray:
         if not self.potential:
@@ -167,7 +192,7 @@ class GraphTransformer(BaseDiffusionModel, EnergyModel, nn.Module):
         assert x.ndim == t.ndim, f"{x.ndim} != {t.ndim}"
 
         val, grad = value_and_grad_sum(self._differentiable_forward, x, features, t, training)
-        return -val.sum(axis=(1, 2))[:, None], (-grad).reshape(x.shape)
+        return -val.sum(axis=(1, 2))[:, None] - self.log_Z(features, t), (-grad).reshape(x.shape)
 
     def supports_energy(self):
         return self.potential
