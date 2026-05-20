@@ -142,6 +142,7 @@ class EvaluationSettings:
     num_langevin_samples: Optional[int] = None  # The number of langevin samples to generate
     num_parallel_langevin_samples: int = 5  # How many langevin simulations are run in parallel
     langevin_dt: Optional[float] = None  # The time step for the langevin simulation, in picoseconds
+    with_mh: bool = False  # Whether to use Metropolis-Hastings acceptance criterion (Langevin dynamics only)
     diffusion_with_mh: bool = False  # Metropolis–Hastings for IID diffusion sampling only (requires log_q_and_score)
     diffusion_mh_steps: int = 1  # MH propose–accept inner iterations per reverse-time step (only if diffusion_with_mh)
     diffusion_num_steps: int = 1000  # Reverse-time discretization steps for IID VP sampling (get_times)
@@ -178,9 +179,19 @@ def evaluate(
         return score_fn(x, features, t)
 
     # define the force function (scaled score)
-    def force(x: jnp.ndarray, features: jnp.ndarray, **kwargs) -> jnp.ndarray:
-        t_array = evaluation.eval_t * jnp.ones((x.shape[0], 1))
-        return dataset.kbT * score_fn(x * norm_factor, features, t_array) * norm_factor
+    def force(x: jnp.ndarray, features: jnp.ndarray, return_energy: bool = False, **kwargs):
+        if return_energy:
+            # t must be broadcasted to (BS, 1) for log_q_and_score
+            t_array = evaluation.eval_t * jnp.ones((x.shape[0], 1))
+            log_q, score = log_q_and_score_fn(x * norm_factor, features, t_array)
+            # energy is -log_q, and we need to scale it by kbT
+            energy_val = -dataset.kbT * log_q
+            # score is the force, we need to scale it by kbT and norm_factor
+            force_val = dataset.kbT * score * norm_factor
+            return force_val, energy_val
+        else:
+            t_array = evaluation.eval_t * jnp.ones((x.shape[0], 1))
+            return dataset.kbT * score_fn(x * norm_factor, features, t_array) * norm_factor
 
     potential = None
     # check if the model has an energy function, and then define it
@@ -246,7 +257,9 @@ def evaluate(
             logp_and_score=diffusion_logp_and_score,
             wandb=wandb,
         )
-        metrics |= simulate_mueller_brown(dataset.train, dataset, force, out_dir, seed=evaluation.seed)
+        metrics |= simulate_mueller_brown(
+            dataset.train, dataset, force, out_dir, seed=evaluation.seed, with_mh=evaluation.with_mh
+        )
     elif isinstance(dataset, ALDPDataset):
         inference_bs = BS
         num_samples = (
@@ -295,6 +308,7 @@ def evaluate(
                 out_dir,
                 "aldp",
                 evaluation.seed,
+                with_mh=evaluation.with_mh,
                 only_store_results=evaluation.only_store_results,
             )
 
@@ -339,6 +353,7 @@ def evaluate(
                 wandb,
                 current_out_folder,
                 evaluation.seed,
+                with_mh=evaluation.with_mh,
                 only_store_results=evaluation.only_store_results,
             )
     elif isinstance(dataset, SingleProteinDataset):
@@ -386,6 +401,7 @@ def evaluate(
                 out_dir,
                 dataset.name,
                 evaluation.seed,
+                with_mh=evaluation.with_mh,
                 only_store_results=evaluation.only_store_results,
             )
 
@@ -691,7 +707,6 @@ def get_samples(
     ts, _ = get_times(num_steps=diffusion_num_steps, t0=t0)
     outer_solver = EulerMaruyama(rsde, ts)
 
-    q_samples = []
     key = jax.random.PRNGKey(seed)
 
     sampler = get_sampler(updated_shape, outer_solver, denoise=False, inverse_scaler=lambda x: x)
@@ -1126,6 +1141,7 @@ def simulate_mueller_brown(
     force: Callable[[jnp.ndarray], jnp.ndarray],
     out_dir: str,
     seed: int,
+    with_mh: bool = False,
 ):
     key = jax.random.PRNGKey(seed)
     key, velocity_key = jax.random.split(key)
@@ -1135,19 +1151,34 @@ def simulate_mueller_brown(
     starting_point = jnp.array([-0.55828035, 1.44169])
     starting_velocity = jnp.sqrt(dataset.kbT / dataset.mass) * jax.random.normal(velocity_key, (2,))
 
-    @jax.jit
-    def adjusted_force(x):
+    def adjusted_force(x, return_energy: bool = False):
         # we don't have any features for toy datasets
-        return force(x.reshape(1, -1), None).reshape(-1)
+        if return_energy:
+            force_, energy_ = force(x.reshape(1, -1), None, return_energy=True)
+            return force_.reshape(-1), energy_.reshape(-1)
+        else:
+            force_ = force(x.reshape(1, -1), None, return_energy=False)
+            return force_.reshape(-1)
 
     n_steps = 50
     step = jax.jit(
-        create_langevin_step_function(adjusted_force, dataset.mass, dataset.gamma, n_steps, dataset.dt, dataset.kbT)
+        create_langevin_step_function(
+            adjusted_force, dataset.mass, dataset.gamma, n_steps, dataset.dt, dataset.kbT, with_mh=with_mh
+        )
     )
 
     log.info(f"Simulating {n_samples} MD steps with {n_steps} intermediate steps")
-    trajectory, velocities = simulate(starting_point, starting_velocity, step, n_samples, key)
-    forces = jnp.array([adjusted_force(x) for x in trajectory])
+    trajectory, velocities, acceptances = simulate(starting_point, starting_velocity, step, n_samples, key)
+    forces = jax.vmap(adjusted_force)(trajectory)
+
+    if with_mh:
+        plt.figure(clear=True)
+        plt.plot(acceptances)
+        plt.xlabel("Step")
+        plt.ylabel("Acceptance Rate")
+        plt.title("MH Acceptance Rate")
+        plt.savefig(f"{out_dir}/mueller-brown-mh-acceptance.png", bbox_inches="tight")
+        plt.close()
 
     plt.figure(clear=True)
     plt.hist(jnp.linalg.norm(forces, axis=1), bins=100)
@@ -1188,11 +1219,14 @@ def simulate_mueller_brown(
         limits_x=dataset.range()[0],
         limits_y=dataset.range()[1],
     )
-    return {
+    metrics = {
         "eval/langevin_js_divergence": js_divergence(datapoints.data, trajectory, bins=100),
         "eval/langevin_rms_fe_sq_error": rms_fe_sq_error,
         "eval/langevin_rms_mjs_error": rms_mjs_error,
     }
+    if with_mh:
+        metrics["eval/mh_acceptance_rate_mean"] = float(jnp.mean(acceptances))
+    return metrics
 
 
 def simulate_single_system(
@@ -1209,6 +1243,7 @@ def simulate_single_system(
     out_dir: str,
     prefix: str,
     seed: int,
+    with_mh: bool = False,
     only_store_results: bool = False,
 ) -> dict:
     if datapoints.data.shape[0] < n_points:
@@ -1230,7 +1265,7 @@ def simulate_single_system(
         else:
             log.warning("No low probability state found. Using random starting points...")
 
-    trajectories, velocities = molecules.simulate_molecule(
+    trajectories, velocities, acceptances = molecules.simulate_molecule(
         dataset,
         force,
         initial_positions,
@@ -1239,6 +1274,7 @@ def simulate_single_system(
         n_steps,
         langevin_dt,
         seed,
+        with_mh,
     )
 
     return molecules.evaluate_langevin_samples(
@@ -1246,6 +1282,7 @@ def simulate_single_system(
         dataset.train.data,
         trajectories,
         velocities,
+        acceptances if with_mh else None,
         max_num_openmm_evaluations,
         dataset.write_animation if hasattr(dataset, "write_animation") else None,
         wandb,
@@ -1267,6 +1304,7 @@ def simulate_minipeptide(
     wandb: bool,
     out_dir: str,
     seed: int,
+    with_mh: bool = False,
     only_store_results: bool = False,
 ) -> dict:
     os.makedirs(out_dir, exist_ok=True)
@@ -1297,8 +1335,8 @@ def simulate_minipeptide(
     initial_positions = jnp.concatenate(initial_positions)
     features = jnp.concatenate(features)
 
-    trajectories, velocities = molecules.simulate_molecule(
-        dataset, force, initial_positions, features, n_samples, n_steps, langevin_dt, seed
+    trajectories, velocities, acceptances = molecules.simulate_molecule(
+        dataset, force, initial_positions, features, n_samples, n_steps, langevin_dt, seed, with_mh
     )
 
     metrics = {}
@@ -1311,6 +1349,7 @@ def simulate_minipeptide(
         else:
             current_trajectories = trajectories[i * n_points : (i + 1) * n_points]
             current_velocities = velocities[i * n_points : (i + 1) * n_points]
+            current_acceptances = acceptances[i * n_points : (i + 1) * n_points] if with_mh else None
 
             baseline_samples = datapoints.data[current_idx:next_idx]
 
@@ -1319,6 +1358,7 @@ def simulate_minipeptide(
                 baseline_samples,
                 current_trajectories,
                 current_velocities,
+                current_acceptances,
                 None,
                 lambda x, out_dir: dataset.write_animation(x, peptide, out_dir),
                 wandb,

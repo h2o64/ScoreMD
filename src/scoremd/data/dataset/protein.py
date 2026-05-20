@@ -210,6 +210,7 @@ class SingleProteinDataset(Dataset):
         num_steps,
         force: Callable[[jnp.ndarray], jnp.ndarray],
         dt: Optional[float] = None,
+        with_mh: bool = False,
     ) -> Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]:
         """
         This function returns a Langevin step function that takes nm coordinates and does num_steps.
@@ -222,6 +223,7 @@ class SingleProteinDataset(Dataset):
             num_steps=num_steps,
             dt=dt if dt is not None else 2e-3,  # 2 fs is the step size used in the simulation
             kbT=self.kbT,
+            with_mh=with_mh,
         )
 
     def plot_contact_map(self, samples, threshold=1, cbar=True, vmin=0.0, vmax=None, contact_map=None, **kwargs):

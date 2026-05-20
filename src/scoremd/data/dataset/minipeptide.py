@@ -285,6 +285,7 @@ class CGMinipeptideDataset(Dataset):
         num_steps,
         force: Callable[[jnp.ndarray], jnp.ndarray],
         dt: Optional[float] = None,
+        with_mh: bool = False,
     ) -> Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]:
         """
         This function returns a Langevin step function that takes nm coordinates and does num_steps.
@@ -297,6 +298,7 @@ class CGMinipeptideDataset(Dataset):
             num_steps=num_steps,
             dt=dt if dt is not None else 5e-4,  # 5e-4 ps is the step size used in the simulation
             kbT=self.kbT,
+            with_mh=with_mh,
         )
 
     def write_animation(self, trajectory: jnp.ndarray, peptide: str, out: PathLike):

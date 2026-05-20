@@ -113,9 +113,9 @@ class MuellerBrownSimulation(Dataset):
         starting_velocity = jnp.sqrt(self.kbT / self.mass) * jax.random.normal(velocity_key, (2,))
 
         step = jax.jit(
-            create_langevin_step_function(self.force, self.mass, self.gamma, self.n_steps, self.dt, self.kbT)
+            create_langevin_step_function(self.force, self.mass, self.gamma, self.n_steps, self.dt, self.kbT, with_mh=False)
         )
-        trajectory, _ = simulate(starting_point, starting_velocity, step, self.n_samples, key)
+        trajectory, _, _ = simulate(starting_point, starting_velocity, step, self.n_samples, key)
         return trajectory
 
     def plot(self, samples: jnp.ndarray, cbar_range: Tuple[float, float] = None, cbar: bool = True):

@@ -178,10 +178,12 @@ class ALDPDataset(Dataset):
         num_steps,
         force: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None,
         dt: Optional[float] = None,
+        with_mh: bool = False,
     ) -> Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]:
         """
         This function returns a Langevin step function that takes nm coordinates and does num_steps.
         See the `create_langevin_step_function` function for more details.
+        Metropolis–Hastings uses ``force(..., return_energy=True)`` from the same callable, not a separate energy.
         """
         return create_langevin_step_function(
             force=self.force if force is None else force,
@@ -190,6 +192,7 @@ class ALDPDataset(Dataset):
             num_steps=num_steps,
             dt=dt if dt is not None else self._dataset.integrator.getStepSize().value_in_unit(unit.picoseconds),
             kbT=self.kbT,
+            with_mh=with_mh,
         )
 
     def get_2d_features(self, trajectory: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:

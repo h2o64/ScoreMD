@@ -116,6 +116,7 @@ def simulate_molecule(
     n_steps: int,
     langevin_dt: Optional[float],
     seed: int,
+    with_mh: bool = False,
 ):
     key = jax.random.PRNGKey(seed)
     key, velocity_key = jax.random.split(key)
@@ -126,14 +127,18 @@ def simulate_molecule(
         velocity_key, (n_points, *dataset.sample_shape)
     )
 
-    def adjusted_force(x, features, point_idx):
+    def adjusted_force(x, features, point_idx, return_energy: bool = False):
         # flatten the input and convert back to (n_atoms, 3)
-        return force(x.reshape(1, -1), features, point_idx=point_idx).reshape(*dataset.sample_shape)
+        if return_energy:
+            force_, energy_ = force(x.reshape(1, -1), features, point_idx=point_idx, return_energy=True)
+            return force_.reshape(*dataset.sample_shape), energy_.reshape(-1)
+        else:
+            return force(x.reshape(1, -1), features, point_idx=point_idx).reshape(*dataset.sample_shape)
 
     @jax.jit
     def multi_step(x, v, key):
         # step each trajectory individually
-        trajectory_step = jax.vmap(dataset.langevin_step_function(n_steps, force=adjusted_force, dt=langevin_dt))
+        trajectory_step = jax.vmap(dataset.langevin_step_function(n_steps, force=adjusted_force, dt=langevin_dt, with_mh=with_mh))
 
         # we need to take care of the keys
         keys = jax.random.split(key, n_points)
@@ -146,16 +151,18 @@ def simulate_molecule(
     @jax.jit
     def _simulate_reshaped(initial_positions, initial_velocities, key):
         # output shape is (n_points, n_samples, -1)
-        trajectories, velocities = simulate(initial_positions, initial_velocities, multi_step, n_samples, key)
+        trajectories, velocities, acceptances = simulate(initial_positions, initial_velocities, multi_step, n_samples, key)
 
         # trajectories now has shape (n_samples, n_points, *dataset.sample_shape), we change that to (n_points, n_samples, -1)
         trajectories = jnp.swapaxes(trajectories, 0, 1).reshape(n_points, n_samples, -1)
         velocities = jnp.swapaxes(velocities, 0, 1).reshape(n_points, n_samples, -1)
+        # acceptances has shape (n_samples, n_points), change to (n_points, n_samples)
+        acceptances = jnp.swapaxes(acceptances, 0, 1)
 
-        return trajectories, velocities
+        return trajectories, velocities, acceptances
 
     gc.collect()  # simulation may need a lot of memory, so we collect garbage
-    trajectories, velocities = _simulate_reshaped(initial_positions, initial_velocities, key)
+    trajectories, velocities, acceptances = _simulate_reshaped(initial_positions, initial_velocities, key)
 
     log.info("Finished simulation")
 
@@ -164,9 +171,11 @@ def simulate_molecule(
 
     if nan_entries.sum() > 0:
         log.warning(f"Found {nan_entries.sum()} NaN entries. Filtering them out...")
-        trajectories, velocities = trajectories[~nan_entries, ...], velocities[~nan_entries, ...]
+        trajectories = trajectories[~nan_entries, ...]
+        velocities = velocities[~nan_entries, ...]
+        acceptances = acceptances[~nan_entries, ...]
 
-    return trajectories, velocities
+    return trajectories, velocities, acceptances
 
 
 def evaluate_langevin_samples(
@@ -174,6 +183,7 @@ def evaluate_langevin_samples(
     baseline: jnp.ndarray,
     trajectories: jnp.ndarray,
     velocities: jnp.ndarray,
+    acceptances: Optional[jnp.ndarray],
     max_num_openmm_evaluations: int,
     write_animation: Optional[Callable[[jnp.ndarray, str], None]],
     wandb: bool,
@@ -187,6 +197,17 @@ def evaluate_langevin_samples(
     log.info(
         f"Saved langevin trajectories and velocities to {out_dir}/{prefix}_langevin_trajectories.npy and {out_dir}/{prefix}_langevin_velocities.npy"
     )
+
+    if acceptances is not None:
+        plt.figure(clear=True)
+        for i, acc in enumerate(acceptances):
+            plt.plot(acc, label=f"Trajectory {prefix} {i}" if len(acceptances) < 10 else None)
+        plt.xlabel("Step")
+        plt.ylabel("Acceptance Rate")
+        if len(acceptances) < 10:
+            plt.legend()
+        plt.savefig(f"{out_dir}/{prefix}_mh_acceptance.png", bbox_inches="tight")
+        plt.close()
 
     if only_store_results:
         return {}
@@ -405,8 +426,11 @@ def evaluate_langevin_samples(
         target_phi, target_psi, sampled_phi_psi[:, 0], sampled_phi_psi[:, 1], n_bins=64
     )
 
-    return {
+    metrics = {
         f"eval/{prefix}_langevin_js_divergence": js_divergence(target_phi_psi, sampled_phi_psi, bins=64),
         f"eval/{prefix}_langevin_rms_fe_sq_error": rms_fe_sq_error,
         f"eval/{prefix}_langevin_rms_mjs_error": rms_mjs_error,
     }
+    if acceptances is not None:
+        metrics[f"eval/{prefix}_mh_acceptance_rate_mean"] = float(jnp.mean(acceptances))
+    return metrics
