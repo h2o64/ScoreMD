@@ -21,6 +21,29 @@ from .utils import (
 import abc
 
 
+def _as_per_batch_1d(z, batch_size: int) -> jnp.ndarray:
+    """Flatten to 1D and broadcast to ``(batch_size,)`` (handles ``(B,1)``, scalar, etc.)."""
+    z = jnp.asarray(z)
+    z = jnp.reshape(z, (-1,))
+    return jnp.broadcast_to(z, (batch_size,))
+
+
+def _log_gaussian_diag_density(x, mean, std):
+    """Log-density of factorized Gaussian; sum over non-batch axes.
+
+    ``std`` may match ``x`` elementwise or be shared across state dimensions (e.g. VP
+    diffusion shape ``(B,)`` with state ``(B, D)``); it is broadcast to ``x.shape``.
+    """
+    std = jnp.maximum(jnp.asarray(std), 1e-20)
+    if std.ndim < x.ndim:
+        std = jnp.reshape(std, std.shape + (1,) * (x.ndim - std.ndim))
+    std = jnp.broadcast_to(std, x.shape)
+    sq = ((x - mean) / std) ** 2
+    axes = tuple(range(1, x.ndim))
+    dim_log_2pi = jnp.sum(jnp.log(2 * jnp.pi * std**2), axis=axes)
+    return -0.5 * jnp.sum(sq, axis=axes) - 0.5 * dim_log_2pi
+
+
 class Solver(abc.ABC):
     """SDE solver abstract class. Functions are designed for a mini-batch of inputs."""
 
@@ -77,6 +100,78 @@ class EulerMaruyama(Solver):
         x_mean = x + f
         x = x_mean + batch_mul(G, noise)
         return x, x_mean
+
+
+class EulerMaruyamaWithMH(EulerMaruyama):
+    """Euler–Maruyama with Metropolis–Hastings accept/reject step(s).
+
+    The proposal is the standard Euler-Maruyama step:
+        x_prop = x + f + G * noise
+    The target for the MH is p(x, features, t - dt) \propto exp(logp(x, features, t - dt)).
+
+    ``diffusion_mh_steps`` repeats propose–accept at the same outer time ``t`` before the
+    sampler advances to the next reverse-time index (still one outer dt per ``update`` call).
+    """
+
+    def __init__(self, sde, ts=None, diffusion_mh_steps: int = 1):
+        super().__init__(sde, ts)
+        self.sde = sde
+        self.prior = sde.prior
+        if diffusion_mh_steps < 1:
+            raise ValueError(f"diffusion_mh_steps must be >= 1, got {diffusion_mh_steps}")
+        self.diffusion_mh_steps = int(diffusion_mh_steps)
+        assert hasattr(sde, "logp") and hasattr(sde, "logp_and_score")
+        assert sde.logp is not None, "EulerMaruyamaWithMH requires sde.logp"
+
+    def update(self, rng, x, features, t):
+        t_min = self.ts[0, 0] if self.ts.ndim > 1 else self.ts[0]
+        t_target = jnp.maximum(t - self.dt, t_min)
+        b = x.shape[0]
+
+        rng_loop = rng
+        x_cur = x
+        x_mean_last = x
+        accepts = []
+
+        for _ in range(self.diffusion_mh_steps):
+            rng_loop, sk = random.split(rng_loop)
+            rng_prop, rng_acc = random.split(sk)
+            drift, diffusion = self.sde.sde(x_cur, features, t)
+            f = drift * self.dt
+            G = diffusion * jnp.sqrt(self.dt)
+            noise = random.normal(rng_prop, x_cur.shape)
+            x_mean = x_cur + f
+            x_prop = x_mean + batch_mul(G, noise)
+
+            # x_prop lives at t_target; x_cur lives at t.
+            log_pi_prop = _as_per_batch_1d(self.sde.logp(x_prop, features, t_target), b)
+            # log_pi_cur = _as_per_batch_1d(self.sde.logp(x_cur, features, t), b)
+            log_pi_cur = _as_per_batch_1d(self.sde.logp(x_cur, features, t_target), b)
+
+            std = jnp.abs(G)
+            log_q_fwd = _as_per_batch_1d(_log_gaussian_diag_density(x_prop, x_mean, std), b)
+
+            # drift_b, diffusion_b = self.sde.sde(x_prop, features, t_target)
+            drift_b, diffusion_b = self.sde.sde(x_prop, features, t)
+            f_b = drift_b * self.dt
+            x_mean_back = x_prop + f_b
+            std_b = jnp.abs(diffusion_b * jnp.sqrt(self.dt))
+            log_q_bwd = _as_per_batch_1d(_log_gaussian_diag_density(x_cur, x_mean_back, std_b), b)
+
+            log_alpha = (log_pi_prop - log_pi_cur) + (log_q_bwd - log_q_fwd)
+            log_accept = jnp.minimum(0.0, _as_per_batch_1d(log_alpha, b))
+
+            u = random.uniform(rng_acc, (b,))
+            accept = (jnp.log(u) < log_accept).astype(jnp.float32)
+            accept = _as_per_batch_1d(accept, b)
+            bcast = accept.reshape(b, *([1] * (x_cur.ndim - 1)))
+            x_prev = x_cur
+            x_cur = jnp.where(bcast, x_prop, x_cur)
+            x_mean_last = jnp.where(bcast, x_mean, x_prev)
+            accepts.append(accept)
+
+        accept_mean = jnp.mean(jnp.stack(accepts, axis=0), axis=0)
+        return x_cur, x_mean_last, accept_mean
 
 
 class Annealed(Solver):

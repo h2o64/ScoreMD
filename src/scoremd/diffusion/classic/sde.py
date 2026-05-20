@@ -14,10 +14,11 @@ from .utils import (
 class RSDE:
     """Reverse SDE class."""
 
-    def __init__(self, score, forward_sde, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, score, forward_sde, logp=None, logp_and_score=None):
         self.score = score
         self.forward_sde = forward_sde
+        self.logp = logp
+        self.logp_and_score = logp_and_score
 
     def sde(self, x, features, t):
         drift, diffusion = self.forward_sde(x, features, t)
@@ -57,8 +58,8 @@ class VE:
     def prior(self, rng, shape):
         return jax.random.normal(rng, shape) * self.sigma_max
 
-    def reverse(self, score):
-        return RVE(score, self.sde, self.sigma)
+    def reverse(self, score, logp=None, logp_and_score=None):
+        return RVE(score, self.sde, self.sigma, logp=logp, logp_and_score=logp_and_score)
 
 
 class BetaVE:
@@ -146,11 +147,15 @@ class VP:
 
         return mean, std
 
-    def reverse(self, score):
-        return RVP(score, self.sde, self.beta, self.log_mean_coeff)
+    def reverse(self, score, logp=None, logp_and_score=None):
+        return RVP(score, self.sde, self.beta, self.log_mean_coeff, logp=logp, logp_and_score=logp_and_score)
 
 
 class RVE(RSDE, VE):
+    def __init__(self, score, forward_sde, sigma, *, logp=None, logp_and_score=None):
+        RSDE.__init__(self, score, forward_sde, logp=logp, logp_and_score=logp_and_score)
+        VE.__init__(self, sigma=sigma)
+
     def get_estimate_x_0_vmap(self, observation_map):
         """
         Get a function returning the MMSE estimate of x_0|x_t.
@@ -204,6 +209,11 @@ class RVE(RSDE, VE):
 
 
 class RVP(RSDE, VP):
+    def __init__(self, score, forward_sde, beta, log_mean_coeff, *, logp=None, logp_and_score=None):
+        RSDE.__init__(self, score, forward_sde, logp=logp, logp_and_score=logp_and_score)
+        self.beta = beta
+        self.log_mean_coeff = log_mean_coeff
+
     def get_estimate_x_0_vmap(self, observation_map):
         """
         Get a function returning the MMSE estimate of x_0|x_t.

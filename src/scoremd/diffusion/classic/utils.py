@@ -517,6 +517,7 @@ def get_sampler(
     denoise=True,
     stack_samples=False,
     inverse_scaler=None,
+    collect_mh_accept_rate: bool = False,
 ):
     """Get a sampler from (possibly interleaved) numerical solver(s).
 
@@ -535,6 +536,8 @@ def get_sampler(
     """
     if inverse_scaler is None:
         inverse_scaler = lambda x: x  # noqa: E731
+    if collect_mh_accept_rate and (inner_solver is not None or stack_samples):
+        raise ValueError("collect_mh_accept_rate requires inner_solver=None and stack_samples=False")
 
     def sampler(rng, features, x_0=None):
         """
@@ -576,15 +579,25 @@ def get_sampler(
         else:
             num_function_evaluations = jnp.size(outer_ts)
 
-            def outer_step(carry, t):
-                rng, x, x_mean = carry
-                vec_t = jnp.full((shape[0],), t)
-                rng, step_rng = jax.random.split(rng)
-                x, x_mean = outer_update(step_rng, x, features, vec_t)
-                if not stack_samples:
-                    return (rng, x, x_mean), ()
-                else:
-                    return ((rng, x, x_mean), x_mean) if denoise else ((rng, x, x_mean), x)
+            if collect_mh_accept_rate:
+                def outer_step(carry, t):
+                    rng, x, x_mean = carry
+                    vec_t = jnp.full((shape[0],), t)
+                    rng, step_rng = jax.random.split(rng)
+                    out = outer_update(step_rng, x, features, vec_t)
+                    x, x_mean = out[0], out[1]
+                    acc_mean = jnp.mean(out[2]) if len(out) == 3 else jnp.array(jnp.nan)
+                    return (rng, x, x_mean), acc_mean
+            else:
+                def outer_step(carry, t):
+                    rng, x, x_mean = carry
+                    vec_t = jnp.full((shape[0],), t)
+                    rng, step_rng = jax.random.split(rng)
+                    x, x_mean = outer_update(step_rng, x, features, vec_t)
+                    if not stack_samples:
+                        return (rng, x, x_mean), ()
+                    else:
+                        return ((rng, x, x_mean), x_mean) if denoise else ((rng, x, x_mean), x)
 
         rng, step_rng = jax.random.split(rng)
         if x_0 is None:
@@ -596,8 +609,11 @@ def get_sampler(
             assert x_0.shape == shape
             x = x_0
         if not stack_samples:
-            (_, x, x_mean), _ = scan(outer_step, (rng, x, x), outer_ts, reverse=True)
-            return inverse_scaler(x_mean if denoise else x), num_function_evaluations
+            (_, x, x_mean), ys = scan(outer_step, (rng, x, x), outer_ts, reverse=True)
+            samples = inverse_scaler(x_mean if denoise else x)
+            if collect_mh_accept_rate:
+                return samples, num_function_evaluations, ys
+            return samples, num_function_evaluations
         else:
             (_, _, _), xs = scan(outer_step, (rng, x, x), outer_ts, reverse=True)
             return inverse_scaler(xs), num_function_evaluations

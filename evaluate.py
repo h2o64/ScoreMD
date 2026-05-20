@@ -5,7 +5,7 @@ from functools import partial
 import logging
 import math
 import os
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -22,6 +22,7 @@ from scoremd.rmsd import kabsch_align_many
 from scoremd.simulation import create_langevin_step_function, simulate
 from scoremd.utils.evaluation import helper_metrics_2d, js_divergence
 from scoremd.utils.plots import plot_force_2d, plot_potential_2d, save_parts_of_figure
+from scoremd.models.base import BaseDiffusionModel
 from flax.core import FrozenDict
 import numpy as onp
 import scoremd.evaluate.molecules as molecules
@@ -30,6 +31,103 @@ import gc
 
 log = logging.getLogger(__name__)
 DPI = 200
+
+
+def build_eval_log_q_score_fns(
+    model: MixtureOfModels,
+    params: FrozenDict[str, Any],
+) -> Tuple[
+    Callable[..., jnp.ndarray],
+    Callable[..., jnp.ndarray],
+    Callable[..., Tuple[jnp.ndarray, jnp.ndarray]],
+]:
+    """Build evaluation-time score / log_q wrappers."""
+
+    def _prepare_model_inputs(
+        x: jnp.ndarray, features: Optional[jnp.ndarray], t: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray, Tuple[int, ...]]:
+        # log_q/log_q_and_score bypass MixtureOfModels.__call__, so we batch single
+        # samples here and restore their shape before returning to divergence/VJP code.
+        return BaseDiffusionModel._reshape_input(x, features, t)
+
+    def _restore_score(score: jnp.ndarray, original_shape: Tuple[int, ...]) -> jnp.ndarray:
+        return score.reshape(original_shape)
+
+    def _restore_log_q(log_q: jnp.ndarray, original_shape: Tuple[int, ...]) -> jnp.ndarray:
+        return log_q.reshape(()) if len(original_shape) == 1 else log_q
+
+    def _raw_log_q_and_score_batched(
+        x: jnp.ndarray, features: Optional[jnp.ndarray], t: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        return model.apply(
+            params,
+            x,
+            features,
+            t,
+            training=False,
+            method=model.__class__.log_q_and_score,
+        )
+
+    def raw_score(x: jnp.ndarray, features: Optional[jnp.ndarray], t: jnp.ndarray):
+        x_batched, features_batched, t_col, original_shape = _prepare_model_inputs(x, features, t)
+        score = model.apply(params, x_batched, features_batched, t_col, training=False)
+        return _restore_score(score, original_shape)
+
+    def raw_log_q_and_score(x: jnp.ndarray, features: Optional[jnp.ndarray], t: jnp.ndarray):
+        x_batched, features_batched, t_col, original_shape = _prepare_model_inputs(x, features, t)
+        log_q, score = _raw_log_q_and_score_batched(x_batched, features_batched, t_col)
+        return _restore_log_q(log_q, original_shape), _restore_score(score, original_shape)
+
+    def raw_log_q(x: jnp.ndarray, features: Optional[jnp.ndarray], t: jnp.ndarray):
+        log_q, _ = raw_log_q_and_score(x, features, t)
+        return log_q
+
+    return raw_score, raw_log_q, raw_log_q_and_score
+
+
+def diffusion_logp_fns_from_model(
+    model: MixtureOfModels,
+    params: FrozenDict[str, Any],
+    norm_factor: jnp.ndarray,
+) -> Tuple[Callable[..., jnp.ndarray], Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]]:
+    """Build ``logp`` / ``logp_and_score`` for diffusion-time Metropolis–Hastings (same scaling as training)."""
+
+    _, log_q_fn, log_q_and_score_fn = build_eval_log_q_score_fns(model, params)
+
+    def logp_and_score(x: jnp.ndarray, features: Optional[jnp.ndarray], t: jnp.ndarray):
+        return log_q_and_score_fn(x * norm_factor, features, t)
+
+    def logp(x: jnp.ndarray, features: Optional[jnp.ndarray], t: jnp.ndarray):
+        lq = log_q_fn(x * norm_factor, features, t)
+        return jnp.reshape(lq, (x.shape[0],))
+
+    return logp, logp_and_score
+
+
+def save_diffusion_mh_acceptance_curve(
+    mh_rates: jnp.ndarray, out_dir: str, basename: str, wandb_enabled: bool
+) -> Dict[str, float]:
+    os.makedirs(out_dir, exist_ok=True)
+    path_npy = os.path.join(out_dir, f"{basename}.npy")
+    path_png = os.path.join(out_dir, f"{basename}.png")
+    y = onp.asarray(mh_rates, dtype=onp.float64)
+    onp.save(path_npy, y)
+    plt.figure(clear=True)
+    plt.plot(y)
+    plt.xlabel("Reverse-time step index")
+    plt.ylabel("Mean batch MH acceptance rate")
+    plt.title("Diffusion sampling (Euler–Maruyama + MH)")
+    plt.ylim(0.0, 1.05)
+    plt.savefig(path_png, bbox_inches="tight")
+    plt.close()
+    metrics = {
+        "eval/diffusion_mh_accept_mean": float(onp.mean(y)),
+        "eval/diffusion_mh_accept_std": float(onp.std(y)),
+    }
+    if wandb_enabled:
+        wandb_lib.save(path_png, base_path=out_dir)
+        wandb_lib.save(path_npy, base_path=out_dir)
+    return metrics
 
 
 @dataclass
@@ -44,6 +142,9 @@ class EvaluationSettings:
     num_langevin_samples: Optional[int] = None  # The number of langevin samples to generate
     num_parallel_langevin_samples: int = 5  # How many langevin simulations are run in parallel
     langevin_dt: Optional[float] = None  # The time step for the langevin simulation, in picoseconds
+    diffusion_with_mh: bool = False  # Metropolis–Hastings for IID diffusion sampling only (requires log_q_and_score)
+    diffusion_mh_steps: int = 1  # MH propose–accept inner iterations per reverse-time step (only if diffusion_with_mh)
+    diffusion_num_steps: int = 1000  # Reverse-time discretization steps for IID VP sampling (get_times)
     max_num_openmm_evaluations: int = 1_000  # The maximum number of openmm calls we do for energy evaluations
     aldp_ensure_start_low_prob: bool = True  # Whether to ensure that one simulation starts in a low probability state
     aldp_evaluate_forces: bool = True  # Whether to evaluate the forces of the model
@@ -69,19 +170,17 @@ def evaluate(
         else evaluation.num_langevin_samples
     )
 
+    score_fn, log_q_fn, log_q_and_score_fn = build_eval_log_q_score_fns(model, params)
+
     def trained_unnormalized_score(x, features, t, *args, **kwargs):
         """The trained score function without any normalization. This is used for sampling."""
-        return model.apply(params, x, features, t, training=False, *args, **kwargs)
+        del args, kwargs
+        return score_fn(x, features, t)
 
     # define the force function (scaled score)
     def force(x: jnp.ndarray, features: jnp.ndarray, **kwargs) -> jnp.ndarray:
-        return (
-            dataset.kbT
-            * model.apply(
-                params, x * norm_factor, features, evaluation.eval_t, training=False, method=model.__class__.force
-            )
-            * norm_factor
-        )
+        t_array = evaluation.eval_t * jnp.ones((x.shape[0], 1))
+        return dataset.kbT * score_fn(x * norm_factor, features, t_array) * norm_factor
 
     potential = None
     # check if the model has an energy function, and then define it
@@ -94,24 +193,58 @@ def evaluate(
         log.info("The model(s) and their weights allow for the evaluation of the potential.")
 
         def potential(x, features):
-            return dataset.kbT * model.apply(
-                params, x * norm_factor, features, evaluation.eval_t, training=False, method=model.__class__.energy
-            )
+            t_array = evaluation.eval_t * jnp.ones((x.shape[0], 1))
+            return -dataset.kbT * log_q_fn(x * norm_factor, features, t_array)
 
     metrics = {}
+
+    diffusion_logp: Optional[Callable[..., jnp.ndarray]] = None
+    diffusion_logp_and_score: Optional[Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]] = None
+    if evaluation.diffusion_with_mh:
+        if not hasattr(model.__class__, "log_q_and_score"):
+            raise ValueError(
+                "evaluation.diffusion_with_mh=True requires model.__class__.log_q_and_score for IID diffusion sampling."
+            )
+        diffusion_logp, diffusion_logp_and_score = diffusion_logp_fns_from_model(
+            model,
+            params,
+            norm_factor,
+        )
 
     # use different evaluation functions for different datasets
     if isinstance(dataset, ToyDataset):
         metrics |= evaluate_toy_dataset(dataset.train, dataset, force, potential, out_dir)
         metrics |= evaluate_toy_samples(
-            dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
+            dataset.train,
+            dataset,
+            trained_unnormalized_score,
+            norm_factor,
+            out_dir,
+            seed=evaluation.seed,
+            diffusion_with_mh=evaluation.diffusion_with_mh,
+            diffusion_mh_steps=evaluation.diffusion_mh_steps,
+            diffusion_num_steps=evaluation.diffusion_num_steps,
+            logp=diffusion_logp,
+            logp_and_score=diffusion_logp_and_score,
+            wandb=wandb,
         )
         if dataset.train.data.shape[-1] == 2:
             metrics |= evaluate_toy_normalization_constant(model, params, out_dir)
     elif isinstance(dataset, MuellerBrownSimulation):
         metrics |= evaluate_mueller_brown(dataset, force, potential, out_dir)
         metrics |= evaluate_mueller_brown_samples(
-            dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
+            dataset.train,
+            dataset,
+            trained_unnormalized_score,
+            norm_factor,
+            out_dir,
+            seed=evaluation.seed,
+            diffusion_with_mh=evaluation.diffusion_with_mh,
+            diffusion_mh_steps=evaluation.diffusion_mh_steps,
+            diffusion_num_steps=evaluation.diffusion_num_steps,
+            logp=diffusion_logp,
+            logp_and_score=diffusion_logp_and_score,
+            wandb=wandb,
         )
         metrics |= simulate_mueller_brown(dataset.train, dataset, force, out_dir, seed=evaluation.seed)
     elif isinstance(dataset, ALDPDataset):
@@ -137,6 +270,11 @@ def evaluate(
                 out_dir,
                 evaluation.seed,
                 only_store_results=evaluation.only_store_results,
+                diffusion_with_mh=evaluation.diffusion_with_mh,
+                diffusion_mh_steps=evaluation.diffusion_mh_steps,
+                diffusion_num_steps=evaluation.diffusion_num_steps,
+                logp=diffusion_logp,
+                logp_and_score=diffusion_logp_and_score,
             )
 
         if evaluation.aldp_evaluate_forces:
@@ -181,6 +319,11 @@ def evaluate(
             wandb,
             current_out_folder,
             evaluation.seed,
+            diffusion_with_mh=evaluation.diffusion_with_mh,
+            diffusion_mh_steps=evaluation.diffusion_mh_steps,
+            diffusion_num_steps=evaluation.diffusion_num_steps,
+            logp=diffusion_logp,
+            logp_and_score=diffusion_logp_and_score,
         )
 
         if num_langevin_samples > 0:
@@ -221,6 +364,11 @@ def evaluate(
                 out_dir,
                 evaluation.seed,
                 only_store_results=evaluation.only_store_results,
+                diffusion_with_mh=evaluation.diffusion_with_mh,
+                diffusion_mh_steps=evaluation.diffusion_mh_steps,
+                diffusion_num_steps=evaluation.diffusion_num_steps,
+                logp=diffusion_logp,
+                logp_and_score=diffusion_logp_and_score,
             )
 
         if num_langevin_samples > 0:
@@ -250,6 +398,8 @@ def evaluate(
             model,
             params,
             trained_unnormalized_score,
+            log_q_fn,
+            log_q_and_score_fn,
             sde,
             wandb,
             out_dir,
@@ -284,6 +434,8 @@ def evaluate_fp_loss(
     model: MixtureOfModels,
     params: FrozenDict[str, Any],
     unnormalized_score: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
+    eval_log_q_fn: Optional[Callable[..., jnp.ndarray]],
+    eval_log_q_and_score_fn: Optional[Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]],
     sde: sdes.VP,
     wandb: bool,
     out_dir: str,
@@ -294,7 +446,10 @@ def evaluate_fp_loss(
     vs, ss = [], []
     key = jax.random.PRNGKey(0)
 
-    if hasattr(model, "log_q_and_score") and hasattr(model, "log_q"):
+    if (eval_log_q_and_score_fn is not None) and (eval_log_q_fn is not None):
+        log_q_and_score_fn = eval_log_q_and_score_fn
+        log_q_fn = eval_log_q_fn
+    elif hasattr(model, "log_q_and_score") and hasattr(model, "log_q"):
 
         def log_q_and_score_fn(x, features, t):
             return model.apply(
@@ -396,6 +551,12 @@ def evaluate_peptide_samples(
     wandb: bool,
     out_dir: str,
     seed: int,
+    *,
+    diffusion_with_mh: bool = False,
+    diffusion_mh_steps: int = 1,
+    diffusion_num_steps: int = 1000,
+    logp: Optional[Callable[..., jnp.ndarray]] = None,
+    logp_and_score: Optional[Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]] = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
     metrics = {}
@@ -424,6 +585,11 @@ def evaluate_peptide_samples(
                 peptide,
                 out_dir,
                 seed,
+                diffusion_with_mh=diffusion_with_mh,
+                diffusion_mh_steps=diffusion_mh_steps,
+                diffusion_num_steps=diffusion_num_steps,
+                logp=logp,
+                logp_and_score=logp_and_score,
             )
 
             # free unused memory
@@ -442,17 +608,87 @@ def get_samples(
     seed: int,
     BS: Optional[int] = None,
     t0: float = 0.0,
-) -> jnp.ndarray:
+    *,
+    diffusion_with_mh: bool = False,
+    diffusion_mh_steps: int = 1,
+    diffusion_num_steps: int = 1000,
+    logp: Optional[Callable[..., jnp.ndarray]] = None,
+    logp_and_score: Optional[Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]] = None,
+) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     from scoremd.diffusion.classic.utils import get_times, get_sampler
-    from scoremd.diffusion.classic.solvers import EulerMaruyama
+    from scoremd.diffusion.classic.solvers import EulerMaruyama, EulerMaruyamaWithMH
+
+    if diffusion_num_steps < 2:
+        raise ValueError(f"diffusion_num_steps must be >= 2, got {diffusion_num_steps}")
 
     log.info(f"Generating {shape[0]} samples ...")
 
     updated_shape = shape if BS is None else (BS, *shape[1:])
 
     log.warning("Hardcoded SDE to VP, in case you want to change it, also change it here")
+    if diffusion_with_mh:
+        if logp is None or logp_and_score is None:
+            raise ValueError(
+                "diffusion_with_mh=True requires logp and logp_and_score (see diffusion_logp_fns_from_model)."
+            )
+        if diffusion_mh_steps < 1:
+            raise ValueError(f"diffusion_mh_steps must be >= 1, got {diffusion_mh_steps}")
+        rsde = sdes.VP().reverse(score, logp=logp, logp_and_score=logp_and_score)
+        ts, _ = get_times(num_steps=diffusion_num_steps, t0=t0)
+        outer_solver = EulerMaruyamaWithMH(rsde, ts, diffusion_mh_steps=diffusion_mh_steps)
+        key = jax.random.PRNGKey(seed)
+        sampler = get_sampler(
+            updated_shape,
+            outer_solver,
+            denoise=False,
+            inverse_scaler=lambda x: x,
+            collect_mh_accept_rate=True,
+        )
+
+        step_size = shape[0] if BS is None else BS
+        num_steps = math.ceil(shape[0] / BS) if BS is not None else 1
+
+        if features is not None:
+            log.info(f"Padding features to {num_steps * step_size} length")
+            features = jnp.pad(
+                features, ((0, num_steps * step_size - features.shape[0]), *([(0, 0)] * (features.ndim - 1)))
+            )
+            log.info(f"Features new shape: {features.shape}")
+
+        n_t = int(outer_solver.ts.shape[0])
+        mh0 = jnp.zeros((n_t,), dtype=jnp.float32)
+
+        def sample_batch(carry, feat_slice):
+            key, mh_sum, cnt = carry
+            key, sample_key = jax.random.split(key)
+            out, _nfe, mh_step = sampler(sample_key, feat_slice)
+            return (key, mh_sum + mh_step, cnt + 1), out
+
+        init_carry = (key, mh0, jnp.array(0, dtype=jnp.int32))
+        (_, mh_sum, cnt), q_samples = jax.lax.scan(
+            sample_batch,
+            init_carry,
+            features.reshape(num_steps, step_size, *features.shape[1:]) if features is not None else None,
+            length=num_steps,
+        )
+
+        q_samples = q_samples.reshape(-1, q_samples.shape[-1])
+
+        nan_entries = jnp.isnan(q_samples).any(axis=1)
+        if nan_entries.sum() > 0:
+            log.warning(f"Found {nan_entries.sum()} NaN entries. Filtering them out...")
+            q_samples = q_samples[~nan_entries]
+        q_samples /= norm_factor
+
+        if q_samples.shape[0] > shape[0]:
+            q_samples = q_samples[: shape[0]]
+
+        log.info(f"{q_samples.shape[0]} samples remaining")
+        mh_rates = mh_sum / jnp.maximum(cnt.astype(jnp.float32), 1.0)
+        return q_samples, mh_rates
+
     rsde = sdes.VP().reverse(score)
-    ts, _ = get_times(num_steps=1000, t0=t0)
+    ts, _ = get_times(num_steps=diffusion_num_steps, t0=t0)
     outer_solver = EulerMaruyama(rsde, ts)
 
     q_samples = []
@@ -666,9 +902,43 @@ def evaluate_toy_normalization_constant(
 
 
 def evaluate_toy_samples(
-    datapoints: Datapoints, dataset: ToyDataset, score: Callable, norm_factor: jnp.ndarray, out_dir: str, seed: int
+    datapoints: Datapoints,
+    dataset: ToyDataset,
+    score: Callable,
+    norm_factor: jnp.ndarray,
+    out_dir: str,
+    seed: int,
+    *,
+    diffusion_with_mh: bool = False,
+    diffusion_mh_steps: int = 1,
+    diffusion_num_steps: int = 1000,
+    logp: Optional[Callable[..., jnp.ndarray]] = None,
+    logp_and_score: Optional[Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]] = None,
+    wandb: bool = False,
 ):
-    q_samples = get_samples(datapoints.data.shape, None, score, norm_factor=norm_factor, seed=seed)
+    if diffusion_with_mh:
+        q_samples, mh_rates = get_samples(
+            datapoints.data.shape,
+            None,
+            score,
+            norm_factor=norm_factor,
+            seed=seed,
+            diffusion_with_mh=True,
+            diffusion_mh_steps=diffusion_mh_steps,
+            diffusion_num_steps=diffusion_num_steps,
+            logp=logp,
+            logp_and_score=logp_and_score,
+        )
+    else:
+        q_samples = get_samples(
+            datapoints.data.shape,
+            None,
+            score,
+            norm_factor=norm_factor,
+            seed=seed,
+            diffusion_num_steps=diffusion_num_steps,
+        )
+        mh_rates = None
     outliers = (jnp.abs(q_samples) > 20).sum(axis=1) > 0
     if outliers.sum() > 0:
         log.warning(f"There are {outliers.mean() * 100:.3f}% outliers. Filtering them out...")
@@ -726,7 +996,10 @@ def evaluate_toy_samples(
         plt.savefig(f"{out_dir}/2d-sampled.png", bbox_inches="tight")
         plt.close()
 
-    return {"eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100)}
+    metrics = {"eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100)}
+    if mh_rates is not None:
+        metrics |= save_diffusion_mh_acceptance_curve(mh_rates, out_dir, "toy-iid-diffusion-mh-acceptance", wandb)
+    return metrics
 
 
 def evaluate_mueller_brown(
@@ -770,8 +1043,37 @@ def evaluate_mueller_brown_samples(
     norm_factor: jnp.ndarray,
     out_dir: str,
     seed: int,
+    *,
+    diffusion_with_mh: bool = False,
+    diffusion_mh_steps: int = 1,
+    diffusion_num_steps: int = 1000,
+    logp: Optional[Callable[..., jnp.ndarray]] = None,
+    logp_and_score: Optional[Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]] = None,
+    wandb: bool = False,
 ):
-    q_samples = get_samples(datapoints.data.shape, None, score, norm_factor=norm_factor, seed=seed)
+    if diffusion_with_mh:
+        q_samples, mh_rates = get_samples(
+            datapoints.data.shape,
+            None,
+            score,
+            norm_factor=norm_factor,
+            seed=seed,
+            diffusion_with_mh=True,
+            diffusion_mh_steps=diffusion_mh_steps,
+            diffusion_num_steps=diffusion_num_steps,
+            logp=logp,
+            logp_and_score=logp_and_score,
+        )
+    else:
+        q_samples = get_samples(
+            datapoints.data.shape,
+            None,
+            score,
+            norm_factor=norm_factor,
+            seed=seed,
+            diffusion_num_steps=diffusion_num_steps,
+        )
+        mh_rates = None
     outliers = (jnp.abs(q_samples) > 20).sum(axis=1) > 0
     if outliers.sum() > 0:
         log.warning(f"There are {outliers.mean() * 100:.3f}% outliers. Filtering them out...")
@@ -806,11 +1108,16 @@ def evaluate_mueller_brown_samples(
         limits_y=dataset.range()[1],
     )
 
-    return {
+    metrics = {
         "eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100),
         "eval/iid_rms_fe_sq_error": rms_fe_sq_error,
         "eval/iid_rms_mjs_error": rms_mjs_error,
     }
+    if mh_rates is not None:
+        metrics |= save_diffusion_mh_acceptance_curve(
+            mh_rates, out_dir, "mueller-brown-iid-diffusion-mh-acceptance", wandb
+        )
+    return metrics
 
 
 def simulate_mueller_brown(
@@ -1040,6 +1347,12 @@ def evaluate_molecule_samples(
     out_dir: str,
     seed: int,
     only_store_results: bool = False,
+    *,
+    diffusion_with_mh: bool = False,
+    diffusion_mh_steps: int = 1,
+    diffusion_num_steps: int = 1000,
+    logp: Optional[Callable[..., jnp.ndarray]] = None,
+    logp_and_score: Optional[Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]] = None,
 ) -> dict:
     if not only_store_results:
         plt.figure(clear=True)
@@ -1048,24 +1361,51 @@ def evaluate_molecule_samples(
         plt.close()
 
     sample_shape = (num_samples, dataset.train.data.shape[1])
-    q_samples = get_samples(
-        sample_shape,
-        features,
-        unnormalized_score,
-        norm_factor=norm_factor,
-        BS=inference_bs,
-        seed=seed,
-    ).reshape(-1, *dataset.sample_shape)
+    if diffusion_with_mh:
+        q_samples, mh_rates = get_samples(
+            sample_shape,
+            features,
+            unnormalized_score,
+            norm_factor=norm_factor,
+            BS=inference_bs,
+            seed=seed,
+            diffusion_with_mh=True,
+            diffusion_mh_steps=diffusion_mh_steps,
+            diffusion_num_steps=diffusion_num_steps,
+            logp=logp,
+            logp_and_score=logp_and_score,
+        )
+    else:
+        q_samples = get_samples(
+            sample_shape,
+            features,
+            unnormalized_score,
+            norm_factor=norm_factor,
+            BS=inference_bs,
+            seed=seed,
+            diffusion_num_steps=diffusion_num_steps,
+        )
+        mh_rates = None
+    q_samples = q_samples.reshape(-1, *dataset.sample_shape)
     q_samples, _ = kabsch_align_many(q_samples, reference_sample)
     onp.save(f"{out_dir}/{prefix}_iid_samples.npy", q_samples)
     log.info(f"Saved iid samples to {out_dir}/{prefix}_iid_samples.npy")
 
     if only_store_results:
+        if diffusion_with_mh and mh_rates is not None:
+            return save_diffusion_mh_acceptance_curve(
+                mh_rates, out_dir, f"{prefix}_iid_diffusion_mh_acceptance", wandb
+            )
         return {}
 
-    return molecules.evaluate_iid_samples(
+    metrics = molecules.evaluate_iid_samples(
         dataset, ground_truth_samples, q_samples, write_animation, wandb, prefix, out_dir
     )
+    if mh_rates is not None:
+        metrics |= save_diffusion_mh_acceptance_curve(
+            mh_rates, out_dir, f"{prefix}_iid_diffusion_mh_acceptance", wandb
+        )
+    return metrics
 
 
 def evaluate_forces_aldp(
