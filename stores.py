@@ -44,6 +44,15 @@ def create_dataset_store(store):
     )
     dataset_store(builds(ALDPDataset, name="aldp", populate_full_signature=True), name="aldp")
     dataset_store(
+        builds(
+            ALDPDataset,
+            name="aldp_full",
+            coarse_graining_level=CoarseGrainingLevel.NONE,
+            populate_full_signature=True,
+        ),
+        name="aldp_full",
+    )
+    dataset_store(
         builds(ALDPDataset, limit_samples=1, validation=False, name="aldp_single", populate_full_signature=True),
         name="aldp_single",
     )
