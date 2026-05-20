@@ -2,6 +2,11 @@
 Below, we list the exact commands used to generate the main results from the paper.
 Note that in this repository, we use slightly different names for the parameters. Most notably, we use $\beta$ instead of $\alpha$ for the regularization strength.
 
+> [!NOTE]
+> Commands for the DiffCLF / RNE auxiliary losses (added on top of this codebase for the paper
+> [*A Diffusive Classification Loss for Learning Energy-based Generative Models*](https://arxiv.org/abs/2601.21025), ICML 2026)
+> are documented in the [Paper modifications](README.md#paper-modifications) section of the README.
+
 You can also find the full hydra configs for the models we trained in the .hydra folder of the resepective model weights. Refer to the [README.md](README.md) on where to find these models.
 
 In case you want to train a model the following two arguments might be useful: `load_dir` can be used to load a trained model, and `continue_from` will do the same but work in the same output directory as specified.

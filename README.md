@@ -14,6 +14,11 @@
   <em>Animation showing the two modes of our model: independent sampling by diffusion denoising (left) and molecular dynamics simulation (right).</em>
 </p>
 
+> [!NOTE]
+> **This is a research fork.** This codebase has been extended for the paper
+> [*A Diffusive Classification Loss for Learning Energy-based Generative Models*](https://arxiv.org/abs/2601.21025) (ICML 2026).
+> The original ScoreMD pipeline is unchanged; the additions are opt-in through new Hydra flags. See [Paper modifications](#paper-modifications) below.
+
 ## Overview
 
 This repository contains the complete codebase for training and evaluating energy-based diffusion models for molecular dynamics simulations. Our approach enables a single model to perform both independent sampling via diffusion denoising and continuous molecular dynamics simulations through a Fokker-Planck-based regularization scheme.
@@ -105,6 +110,100 @@ To reproduce the results from our paper, see [TRAIN.md](TRAIN.md) for the exact 
 ## Evaluation and Plotting Scripts
 
 For implementation details and benchmarking against your own methods, we provide evaluation scripts in the [evaluation](evaluation/README.md) directory.
+
+# Paper modifications
+
+This fork adds the auxiliary losses, samplers, and evaluation hooks used in
+[*A Diffusive Classification Loss for Learning Energy-based Generative Models*](https://arxiv.org/abs/2601.21025) (ICML 2026).
+All additions are off by default; the original training and evaluation paths are unchanged.
+
+## What's new
+
+- **DiffCLF loss** (`src/scoremd/diffusion/diffclf.py`, `time_sampling.py`) — a contrastive
+  classification objective over noise levels. The `k=2` binary form is the loss used in the paper;
+  `k>2` falls back to a multi-class form.
+- **RNE loss** (`src/scoremd/diffusion/rne.py`) — residual-noise-estimation regularizer that
+  matches forward/backward transition densities of the diffusion. Needs `VP.forward_transition_params`
+  / `VP.backward_transition_params`, added in `src/scoremd/diffusion/classic/sde.py`.
+- **DSM warmup epochs** (`src/scoremd/training/schedule.py`) — option to run the first N epochs
+  with the plain score-matching loss before turning on DiffCLF/RNE.
+- **MH-corrected reverse-time sampling** (`src/scoremd/diffusion/classic/solvers.py:EulerMaruyamaWithMH`,
+  `get_sampler(collect_mh_accept_rate=True)`, `evaluate.py` helpers) — Metropolis–Hastings accept/reject
+  step at each reverse-time index, using the model's `log_q` as the target.
+- **HMC MD step** (`src/scoremd/simulation.py:step_with_mh`) — leapfrog HMC alternative to the
+  plain Langevin integrator at evaluation time, threaded through the dataset classes via `with_mh`.
+- **Optional time-dependent `log_Z`** (`src/scoremd/models/timenet.py`, `GraphTransformer.log_Z`) —
+  a small sinusoidal-embedding MLP subtracted from `log_q(x, t)` to absorb the time-varying
+  normalizer.
+
+## How to use
+
+Activate via Hydra overrides on top of the existing training/evaluation commands.
+
+**DiffCLF training (paper setup, ALDP):**
+```bash
+python train.py dataset=aldp +architecture=transformer/potential \
+  dataset.coarse_graining_level=full \
+  training_schedule.losses.0.loss.alpha=0.0 \
+  training_schedule.losses.0.loss.beta=0.0 \
+  training_schedule.losses.0.loss.diffclf_weight=1.0
+```
+
+**RNE training** (replace or combine with `diffclf_weight`):
+```bash
+  training_schedule.losses.0.loss.rne_weight=1.0 \
+  training_schedule.losses.0.loss.rne_delta_t=1e-4
+```
+
+**DSM warmup** (score-only for the first N epochs, then auxiliary loss kicks in):
+```bash
+  training_schedule.dsm_warmup_epochs=500
+```
+
+**Time-dependent `log_Z` on the energy head:**
+```bash
+  +architecture.model.use_time_net=True
+```
+
+**MH-corrected reverse-time IID sampling at evaluation time:**
+```bash
+  evaluation.diffusion_with_mh=True \
+  evaluation.diffusion_mh_steps=1 \
+  evaluation.diffusion_num_steps=1000
+```
+
+**HMC MD step at evaluation time:**
+```bash
+  evaluation.with_mh=True
+```
+
+## Citation
+
+If you use any of the additions above, please also cite:
+
+```
+@inproceedings{anonymous2026a,
+  title = {A Diffusive Classification Loss for Learning Energy-based Generative Models},
+  author = {Anonymous},
+  booktitle = {Forty-third International Conference on Machine Learning},
+  year = {2026},
+  url = {https://openreview.net/forum?id=RVPqygyGRu}
+}
+```
+
+or the arXiv version:
+
+```
+@misc{ouyang2026diffusiveclassificationlosslearning,
+  title = {A Diffusive Classification Loss for Learning Energy-based Generative Models},
+  author = {RuiKang OuYang and Louis Grenioux and Jos{\'e} Miguel Hern{\'a}ndez-Lobato},
+  year = {2026},
+  eprint = {2601.21025},
+  archivePrefix = {arXiv},
+  primaryClass = {stat.ML},
+  url = {https://arxiv.org/abs/2601.21025}
+}
+```
 
 # Contributing
 
